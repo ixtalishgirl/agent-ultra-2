@@ -103,16 +103,39 @@ def _press(s, **kw):
     return {"key": kw["key"], "url": s.page().url}
 
 
+def _settled_scroll_y(s, before, timeout_s=0.5):
+    """Poll scrollY until the wheel's scroll lands, or timeout.
+
+    A mouse wheel scroll applies asynchronously: reading scrollY
+    immediately after the wheel can still show the old value even
+    though the scroll lands a moment later. Polling (50 ms steps,
+    capped) reports the settled value instead of a stale zero.
+    An evaluate failure propagates as the real error.
+    """
+    deadline = time.monotonic() + timeout_s
+    while True:
+        current = s.page().evaluate("window.scrollY")
+        if current != before:
+            return current
+        if time.monotonic() >= deadline:
+            return current
+        time.sleep(0.05)
+
+
 def _scroll_down(s, **kw):
     amount = float(kw.get("amount", 600))
-    s.page().mouse.wheel(0, amount)
-    return {"scrolled": amount, "y": s.page().evaluate("window.scrollY")}
+    page = s.page()
+    before = page.evaluate("window.scrollY")
+    page.mouse.wheel(0, amount)
+    return {"scrolled": amount, "y": _settled_scroll_y(s, before)}
 
 
 def _scroll_up(s, **kw):
     amount = float(kw.get("amount", 600))
-    s.page().mouse.wheel(0, -amount)
-    return {"scrolled": -amount, "y": s.page().evaluate("window.scrollY")}
+    page = s.page()
+    before = page.evaluate("window.scrollY")
+    page.mouse.wheel(0, -amount)
+    return {"scrolled": -amount, "y": _settled_scroll_y(s, before)}
 
 
 def _scroll_to(s, **kw):

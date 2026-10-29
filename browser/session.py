@@ -58,6 +58,7 @@ class BrowserSession:
         self.extra_args = list(args) if args else []
         self.timings = []  # [{"action", "ms", "ok"}] — measured only
         self._pw = None
+        self._pw_cm = None
         self._ctx = None
         self._page = None
 
@@ -68,17 +69,22 @@ class BrowserSession:
             return self._page
         pw_cm = _new_page_context()
         self._pw = pw_cm.start()
+        # Hold the context manager: dropping it while the session
+        # lives risks the driver being torn down under us.
+        self._pw_cm = pw_cm
         try:
             self._ctx = self._pw.chromium.launch_persistent_context(
                 str(self.profile_dir),
                 headless=self.headless,
                 viewport=self.viewport,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
+                args=["--no-sandbox", "--disable-dev-shm-usage",
+                      "--disable-gpu"]
                 + self.extra_args,
             )
         except Exception as exc:
             self._pw.stop()
             self._pw = None
+            self._pw_cm = None
             raise BrowserNotAvailable(
                 "BROWSER-ABSENT: Chromium could not be launched "
                 f"({exc}). Run `playwright install chromium` first."
@@ -93,15 +99,22 @@ class BrowserSession:
         return self._page
 
     def close(self):
+        """Best-effort close: a dead connection must not raise here,
+        so recovery (drop + relaunch) can always run."""
         try:
             if self._ctx is not None:
                 self._ctx.close()
-        finally:
+        except Exception:
+            pass
+        try:
             if self._pw is not None:
                 self._pw.stop()
-            self._ctx = None
-            self._page = None
-            self._pw = None
+        except Exception:
+            pass
+        self._ctx = None
+        self._page = None
+        self._pw = None
+        self._pw_cm = None
 
     def __enter__(self):
         self.start()
