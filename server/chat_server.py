@@ -37,6 +37,12 @@ objects directly. If a session's connection dies anyway (killed
 Chromium on a small host), the action path drops the dead session
 and retries exactly once on a fresh session; the screenshot path
 drops it and reports the real error, so the next Open rebuilds.
+A further failure mode is a poisoned worker thread: when a driver
+dies mid-call, Playwright's thread-local loop state can make the
+next sync_playwright() raise its sync-in-asyncio-loop error on
+that thread. That text is a dead-session marker (drop + retry
+once), and the worker itself abandons the poisoned thread for a
+fresh one and retries the call there exactly once.
 """
 
 import json
@@ -107,6 +113,14 @@ _DEAD_MARKERS = (
     "Cannot switch to a different thread",
     "Target page, context or browser has been closed",
     "Browser has been closed",
+    # Playwright's sync API can also fail with its sync-in-asyncio
+    # error when a dead driver left the thread's loop state
+    # poisoned (seen live 2026-10-29: a goto on a stale session
+    # answered in 0.1ms with exactly this text). It means the
+    # session is unusable, so it gets the same drop-and-retry
+    # treatment; the worker thread itself self-heals separately
+    # (browser/worker.py) when the error is raised through it.
+    "inside the asyncio loop",
 )
 
 

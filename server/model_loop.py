@@ -24,6 +24,7 @@ import json
 
 from browser.profile import DEFAULT_BASE_DIR, profile_dir_for
 from browser.session import BrowserSession
+from browser.worker import get_worker
 from server import model_client
 
 MAX_TOOL_ROUNDS = 3
@@ -140,7 +141,11 @@ def run(messages, session_factory=None):
                             factory = session_factory or _default_session_factory
                             session = factory()
                             session_owned = session_factory is None
-                        result = session.act("goto", url=url)
+                        # The loop runs on an HTTP handler thread;
+                        # Playwright itself only ever runs on the
+                        # dedicated browser worker thread.
+                        result = get_worker().submit(
+                            lambda: session.act("goto", url=url))
                         browser_results.append(result)
                 else:
                     result = _tool_result_for_unknown(name)
@@ -152,7 +157,7 @@ def run(messages, session_factory=None):
     finally:
         if session is not None and session_owned:
             try:
-                session.close()
+                get_worker().submit(session.close, timeout=30)
             except Exception:
                 pass
     return {
