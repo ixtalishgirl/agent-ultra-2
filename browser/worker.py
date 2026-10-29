@@ -46,6 +46,18 @@ _POISON_MARKERS = ("inside the asyncio loop",)
 
 def _is_poison_error(exc):
     """True when exc is Playwright's sync-in-asyncio-loop error."""
+    return is_poison_error(exc)
+
+
+def is_poison_error(exc):
+    """True when exc is Playwright's sync-in-asyncio-loop error.
+
+    Public because BrowserSession.act() must NOT swallow this one:
+    it is thread-state poison, not a session failure, and only the
+    worker (which owns the thread) can recover from it. act()
+    re-raises it so submit() can abandon the poisoned thread and
+    retry on a fresh one.
+    """
     text = f"{type(exc).__name__}: {exc}"
     return any(marker in text for marker in _POISON_MARKERS)
 
