@@ -13,6 +13,9 @@ Endpoints:
                                per-copy BrowserSession, created lazily
                                with that copy's own profile
   GET  /api/tools              registered tools (name + args only)
+  POST /api/shell              {"command", "timeout_s"} runs one bash
+                               command in the pinned work directory
+                               and returns the real result
   POST /api/chat               {"messages"} through the model loop,
                                or the honest not-live reply
   POST /api/arena/run          {"task_id", "copies", "max_concurrent"}
@@ -60,6 +63,7 @@ from copies.arena import run_arena
 from server.health import health as real_health
 from server.model_loop import run as run_model_loop
 from tools.registry import Registry, ToolRegistrationError
+from tools.shell_tool import run_shell
 
 _UI_DIR = Path(__file__).resolve().parent / "ui"
 _UI_FILES = {
@@ -266,6 +270,8 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/browser/action":
             self._handle_browser_action(body)
+        elif path == "/api/shell":
+            self._handle_shell(body)
         elif path == "/api/chat":
             self._handle_chat(body)
         elif path == "/api/arena/run":
@@ -352,6 +358,22 @@ class _Handler(BaseHTTPRequestHandler):
         tools = [{"tool": name, "arg_names": rec.get("arg_names", [])}
                  for name, rec in sorted(listed.items())]
         self._send_json(200, {"tools": tools})
+
+    def _handle_shell(self, body):
+        command = body.get("command")
+        timeout_s = body.get("timeout_s", 30)
+        if not isinstance(command, str) or not command.strip():
+            self._send_json(
+                400, {"error": "command must be a non-empty string"})
+            return
+        if isinstance(timeout_s, bool) or not isinstance(
+                timeout_s, (int, float)):
+            self._send_json(400, {"error": "timeout_s must be a number"})
+            return
+        # Deterministic proof path: real bash in the pinned work
+        # directory, no model involved.
+        result = run_shell(command, timeout_s=timeout_s)
+        self._send_json(200, result)
 
     def _handle_browser_action(self, body):
         action = body.get("action")
