@@ -416,6 +416,11 @@ def dispatch_browser_action(session, tool_name, args=None):
 
     Returns the timed result dict from ``session.act``. A session
     without ``act`` yields an honest failure, never a success.
+
+    Playwright's sync-in-asyncio-loop error is NOT converted to a
+    failure dict: it propagates to the caller, because only
+    BrowserWorker.submit() can recover from poisoned thread state
+    (abandon the thread, retry once on a fresh one).
     """
     act = getattr(session, "act", None)
     if not callable(act):
