@@ -205,3 +205,55 @@ Full 100 copies are allowed through the same endpoint via waves.
 - No accelerator is required or used, and nothing here is paid.
 - This build is local only. Deploy claims wait for a real deploy
   plus a verified `/health` on the deployed URL.
+
+## 5. Browser thread ownership (fix 2026-10-29)
+
+Deployed symptom: one real goto worked, then the panel never
+showed a live session, screenshots failed with "Playwright
+connection closed" (TargetClosedError), and later opens failed
+the same way. Root cause, reproduced locally: Playwright's sync
+API is bound to the thread (greenlet) that created it. The server
+is a ThreadingHTTPServer, so every request runs on a different
+thread; a session created by the goto thread broke on the
+screenshot thread ("Cannot switch to a different thread"), and
+once the creating thread died the connection degraded to
+"Playwright connection closed". Nothing in the old code ever
+closed the session — the threading did it.
+
+Fix:
+
+- `browser/worker.py` owns ONE dedicated browser thread. Every
+  Playwright call (actions, screenshots, status probes) runs on
+  it via `submit()`; HTTP threads never touch Playwright objects
+  directly. Nested submits from the worker thread run inline
+  instead of deadlocking.
+- `server/chat_server.py` routes actions through
+  `run_browser_action()` and screenshots through the worker.
+  Screenshot honors `?copy=<id>` (the old handler ignored the
+  query and always showed the last copy). New endpoint
+  `GET /api/browser/status` reports session ids plus the active
+  copy's real liveness (a driver round-trip probe).
+- Dead-connection recovery: an action that fails with a dead
+  connection error drops the dead session (closing it first, so
+  its Chromium memory is freed) and retries exactly once on a
+  fresh session. A screenshot that hits a dead connection drops
+  the session and reports the real error, so the next Open
+  rebuilds it. Other failures are never retried.
+- `browser/session.py` holds the Playwright context manager for
+  the session's life (it was a local that could be dropped),
+  closes best-effort so a dead connection never blocks cleanup,
+  and passes `--disable-gpu` for small hosts.
+
+Small-host note: Render Free has 512 MB. One Chromium fits; a
+second concurrent Chromium (a second copy id) can push the box
+into OOM, which also surfaces as a dead connection. Recovery
+(relaunch on demand) is the mitigation in this repo; fitting a
+fleet on one small host is not claimed. A bigger host is the
+real fix for fleet use, and it is a paid step the owner has not
+ordered.
+
+Arena browser note: the arena API runs without a browser object
+today, so arena runs never touch Playwright. If a browser factory
+is wired into arena runs later, it must route through the same
+browser worker thread, or the same breakage returns.
+
