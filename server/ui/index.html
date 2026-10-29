@@ -29,7 +29,32 @@
       <input id="browser-url" type="text" autocomplete="off" placeholder="URL" aria-label="URL">
       <button type="submit">Open</button>
     </form>
+    <form id="browser-action-form">
+      <select id="browser-action" aria-label="Action">
+        <option value="click">click</option>
+        <option value="scroll_down">scroll_down</option>
+        <option value="scroll_up">scroll_up</option>
+        <option value="reload">reload</option>
+        <option value="back">back</option>
+        <option value="get_title">get_title</option>
+        <option value="get_url">get_url</option>
+      </select>
+      <input id="browser-selector" type="text" autocomplete="off" placeholder="selector (for click)" aria-label="selector">
+      <input id="browser-amount" type="text" autocomplete="off" placeholder="amount (for scroll)" aria-label="amount">
+      <button type="submit">Act</button>
+    </form>
     <pre id="browser-result"></pre>
+  </section>
+  <section id="copies-panel">
+    <h2>Copies</h2>
+    <form id="copies-form">
+      <input id="copies-task" type="text" value="arena-task" aria-label="Task id">
+      <input id="copies-count" type="number" value="4" min="1" aria-label="Copies">
+      <input id="copies-concurrent" type="number" value="4" min="1" aria-label="Max concurrent">
+      <button type="submit">Run arena</button>
+    </form>
+    <p>Many copies take a while: they run in waves on this host, not all at once.</p>
+    <pre id="copies-result"></pre>
   </section>
 </main>
 <script src="/ui/app.js"></script>
