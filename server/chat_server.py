@@ -4,8 +4,11 @@ Endpoints:
 
   GET  /health                 real health() from server/health.py
   GET  /ui                     chat page (plus /ui/style.css, /ui/app.js)
-  GET  /api/browser/screenshot live PNG from the active session,
+  GET  /api/browser/screenshot live PNG from the active session
+                               (or ?copy=<id> for one copy),
                                or honest 404 "no live browser session"
+  GET  /api/browser/status    session list + active copy liveness,
+                               probed for real on the browser thread
   POST /api/browser/action     {"action", "args", "copy_id"} on a
                                per-copy BrowserSession, created lazily
                                with that copy's own profile
@@ -22,6 +25,18 @@ a profile (cookies, tokens, or any stored values) is ever returned
 by any endpoint. A screenshot is served only when a session has a
 real open page; otherwise the endpoint answers 404, never a
 placeholder image.
+
+THREAD OWNERSHIP (fix for the deployed session bug): Playwright's
+sync API is bound to the thread that created it, and the HTTP
+server is threaded, so a session created by one request thread
+broke on the next request thread (goto worked, then every
+screenshot and action failed with a dead connection). Every
+Playwright call here therefore runs on the single browser worker
+thread (browser/worker.py); HTTP threads never touch Playwright
+objects directly. If a session's connection dies anyway (killed
+Chromium on a small host), the action path drops the dead session
+and retries exactly once on a fresh session; the screenshot path
+drops it and reports the real error, so the next Open rebuilds.
 """
 
 import json
@@ -29,10 +44,12 @@ import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import parse_qs, urlsplit
 
 from browser import dispatch_browser_action
 from browser.profile import DEFAULT_BASE_DIR, profile_dir_for, safe_copy_id
 from browser.session import BrowserSession
+from browser.worker import get_worker
 from copies.arena import run_arena
 from server.health import health as real_health
 from server.model_loop import run as run_model_loop
@@ -49,16 +66,23 @@ _UI_FILES = {
 _sessions = {}
 _sessions_lock = threading.Lock()
 _last_copy_id = {"copy_id": None}
+_PROFILE_BASE_DIR = DEFAULT_BASE_DIR
 
 
-def _get_session(copy_id):
-    """Return the session for one copy, creating it lazily."""
+def _get_session(copy_id, base_dir=None):
+    """Return the session object for one copy, creating it lazily.
+
+    Creating the object touches no Playwright state (only the
+    profile directory); starting the browser happens on the
+    browser worker thread when an action runs.
+    """
     copy_id = safe_copy_id(copy_id)
+    base = Path(base_dir) if base_dir is not None else _PROFILE_BASE_DIR
     with _sessions_lock:
         session = _sessions.get(copy_id)
         if session is None:
             session = BrowserSession(
-                profile_dir_for(DEFAULT_BASE_DIR, copy_id),
+                profile_dir_for(base, copy_id),
                 headless=True,
             )
             _sessions[copy_id] = session
@@ -72,6 +96,66 @@ def _active_session():
         if copy_id is None:
             return None
         return _sessions.get(copy_id)
+
+
+# Error text that means "this session's browser connection is dead"
+# (killed Chromium, dead creating thread). Only these trigger the
+# drop-and-retry recovery; any other failure is returned as-is.
+_DEAD_MARKERS = (
+    "TargetClosedError",
+    "Playwright connection closed",
+    "Cannot switch to a different thread",
+    "Target page, context or browser has been closed",
+    "Browser has been closed",
+)
+
+
+def _is_dead_error_text(text):
+    text = text or ""
+    return any(marker in text for marker in _DEAD_MARKERS)
+
+
+def _is_dead_result(result):
+    if not isinstance(result, dict) or result.get("ok") is not False:
+        return False
+    detail = result.get("detail") or {}
+    error = detail.get("error") if isinstance(detail, dict) else None
+    return isinstance(error, str) and _is_dead_error_text(error)
+
+
+def _drop_session(copy_id):
+    """Remove a session and close it on the browser thread,
+    best-effort, freeing its Chromium before any relaunch."""
+    copy_id = safe_copy_id(copy_id)
+    with _sessions_lock:
+        session = _sessions.pop(copy_id, None)
+    if session is not None:
+        try:
+            get_worker().submit(session.close, timeout=30)
+        except Exception:
+            pass
+
+
+def run_browser_action(copy_id, action, args, base_dir=None):
+    """Run one browser action on the browser worker thread.
+
+    The session is created lazily. If the action fails because the
+    browser connection is dead, the dead session is dropped and
+    the action is retried exactly once on a fresh session. Any
+    other failure is returned as-is, never retried: a retry after
+    a dead connection can repeat an action that partially landed,
+    so one retry is the limit.
+    """
+    worker = get_worker()
+    session = _get_session(copy_id, base_dir=base_dir)
+    result = worker.submit(
+        lambda: dispatch_browser_action(session, action, args))
+    if _is_dead_result(result):
+        _drop_session(copy_id)
+        session = _get_session(copy_id, base_dir=base_dir)
+        result = worker.submit(
+            lambda: dispatch_browser_action(session, action, args))
+    return result
 
 
 def create_server(port, host="0.0.0.0"):
@@ -152,6 +236,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
         elif path == "/api/browser/screenshot":
             self._handle_screenshot()
+        elif path == "/api/browser/status":
+            self._handle_browser_status()
         elif path == "/api/tools":
             self._handle_tools()
         else:
@@ -175,16 +261,33 @@ class _Handler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------- handlers
     def _handle_screenshot(self):
+        # ?copy=<id> pins the screenshot to one copy; without it
+        # the last copy used by an action is shown.
+        query = parse_qs(urlsplit(self.path).query)
+        wanted = query.get("copy", [None])[0]
+        if wanted:
+            with _sessions_lock:
+                _last_copy_id["copy_id"] = safe_copy_id(wanted)
         session = _active_session()
         page = getattr(session, "_page", None) if session is not None else None
         if session is None or page is None:
             self._send_text(404, "no live browser session")
             return
         try:
-            shot = page.screenshot()
+            # The page object is only CALLED on the browser thread;
+            # calling it here would break the thread binding.
+            shot = get_worker().submit(lambda: page.screenshot(), timeout=30)
         except Exception as exc:  # real error, reported, not faked
+            dropped = False
+            if _is_dead_error_text(f"{type(exc).__name__}: {exc}"):
+                with _sessions_lock:
+                    doomed = _last_copy_id["copy_id"]
+                if doomed is not None:
+                    _drop_session(doomed)
+                    dropped = True
             self._send_json(502, {
-                "error": f"screenshot failed: {type(exc).__name__}: {exc}"})
+                "error": f"screenshot failed: {type(exc).__name__}: {exc}",
+                "session_dropped": dropped})
             return
         if not isinstance(shot, (bytes, bytearray)) or not shot:
             self._send_text(404, "no live browser session")
@@ -194,6 +297,37 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(shot)))
         self.end_headers()
         self.wfile.write(bytes(shot))
+
+    def _handle_browser_status(self):
+        with _sessions_lock:
+            copy_ids = sorted(_sessions.keys())
+            active_id = _last_copy_id["copy_id"]
+            session = _sessions.get(active_id) if active_id else None
+            page = getattr(session, "_page", None) if session else None
+        alive = None
+        url = None
+        title = None
+        if page is not None:
+            try:
+                # evaluate("1") is a real driver round-trip: it
+                # succeeds only while the connection is alive.
+                get_worker().submit(lambda: page.evaluate("1"), timeout=30)
+                alive = True
+            except Exception:
+                alive = False
+            if alive:
+                try:
+                    url, title = get_worker().submit(
+                        lambda: (page.url, page.title()), timeout=30)
+                except Exception:
+                    url, title = None, None
+        self._send_json(200, {
+            "sessions": copy_ids,
+            "active_copy_id": active_id,
+            "active_alive": alive,
+            "active_url": url,
+            "active_title": title,
+        })
 
     def _handle_tools(self):
         try:
@@ -218,8 +352,7 @@ class _Handler(BaseHTTPRequestHandler):
         if not isinstance(copy_id, str) or not copy_id:
             self._send_json(400, {"error": "copy_id must be a non-empty string"})
             return
-        session = _get_session(copy_id)
-        result = dispatch_browser_action(session, action, args)
+        result = run_browser_action(copy_id, action, args)
         self._send_json(200, result)
 
     def _handle_chat(self, body):
