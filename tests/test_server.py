@@ -27,6 +27,7 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from browser import playwright_available  # noqa: E402
 from server import model_client  # noqa: E402
+import server.model_loop as model_loop_module  # noqa: E402
 from server.chat_server import create_server  # noqa: E402
 from server.model_loop import BROWSER_OPEN_TOOL, run as run_model_loop  # noqa: E402
 
@@ -230,14 +231,20 @@ def t_model_loop_tool_rules():
     assert result["browser_results"][0]["ms"] == 12.5, result
     # The caller's messages are unchanged.
     assert incoming == [{"role": "user", "content": "open the page"}], incoming
-    # First call carried exactly one tool, name + schema only.
+    # First call carried exactly the four model tools, each with
+    # name + parameter schema only (no model-facing text).
     first_messages, first_tools = calls[0]
     assert first_messages == incoming, first_messages
-    assert len(first_tools) == 1, first_tools
-    assert first_tools[0] == BROWSER_OPEN_TOOL, first_tools
-    fn = first_tools[0]["function"]
-    assert set(fn.keys()) == {"name", "parameters"}, fn
-    assert fn["name"] == "browser_open", fn
+    assert len(first_tools) == 4, first_tools
+    names = [t["function"]["name"] for t in first_tools]
+    assert names == ["browser_open", "run_shell", "create_tool",
+                     "use_tool"], names
+    for tool in first_tools:
+        assert set(tool.keys()) == {"type", "function"}, tool
+        assert tool["type"] == "function", tool
+        fn = tool["function"]
+        assert set(fn.keys()) == {"name", "parameters"}, fn
+        assert isinstance(fn["parameters"], dict), fn
     # The fake session really ran goto.
     assert created and created[0].acts == [
         ("goto", {"url": "https://example.com"})], created[0].acts
@@ -286,6 +293,171 @@ def t_model_loop_unknown_tool_not_executed():
     assert created == [], "unknown tool must not create a browser session"
 
 
+def t_model_loop_shell_create_use_sequence():
+    # Mocked backend calls run_shell, then create_tool, then
+    # use_tool. Each must really execute; create_tool must go
+    # through the 5-stage pipeline and register; use_tool must
+    # dispatch the newly created tool. The registry is a temp
+    # file so the repo registry is never touched.
+    import tempfile
+    from tools.registry import Registry
+    _set_env("https://backend.invalid/chat", "test-backend")
+    tmp = tempfile.mkdtemp(prefix="model-loop-test-")
+    tmp_registry = Registry(Path(tmp) / "registry.json")
+    original_registry = model_loop_module.Registry
+    model_loop_module.Registry = lambda: tmp_registry
+    GREET_SOURCE = "def greet(name):\n    return \"hi \" + name\n"
+
+    def tool_call(call_id, name, arguments):
+        return {
+            "content": None,
+            "tool_calls": [{"id": call_id, "name": name,
+                            "arguments": arguments}],
+            "message": {"role": "assistant", "content": None,
+                        "tool_calls": [{"id": call_id, "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": json.dumps(arguments)}}]},
+        }
+
+    steps = iter([
+        tool_call("c-1", "run_shell",
+                  {"command": "echo hello-tool", "timeout_s": 10}),
+        tool_call("c-2", "create_tool",
+                  {"name": "greet", "description": "greets by name",
+                   "source": GREET_SOURCE, "arg_names": ["name"],
+                   "tests": [{"args": ["world"],
+                              "expected": "hi world"}]}),
+        tool_call("c-3", "use_tool",
+                  {"tool": "greet", "args": ["world"]}),
+    ])
+
+    def fake_chat(messages, tools=None):
+        try:
+            return next(steps)
+        except StopIteration:
+            return {"content": "done", "tool_calls": [],
+                    "message": {"role": "assistant", "content": "done"}}
+
+    original = model_client.chat
+    model_client.chat = fake_chat
+    try:
+        result = run_model_loop(
+            [{"role": "user", "content": "do the sequence"}],
+            session_factory=lambda: _FakeSession())
+    finally:
+        model_client.chat = original
+        model_loop_module.Registry = original_registry
+
+    assert result["reply"] == "done", result
+    assert result["tool_rounds"] == 3, result
+    assert result["live"] is True, result
+
+    # Each round really executed: the registry now holds the new
+    # tool and it dispatches real output.
+    assert "greet" in tmp_registry.list(), "create_tool must register"
+    assert tmp_registry.dispatch("greet", {"name": "zed"}) == "hi zed"
+
+
+def t_model_loop_shell_create_use_results():
+    # Same sequence, but asserts the tool-message payloads the
+    # loop fed back: real shell output, the full pipeline report,
+    # and the real dispatch result.
+    import tempfile
+    from tools.registry import Registry
+    _set_env("https://backend.invalid/chat", "test-backend")
+    tmp = tempfile.mkdtemp(prefix="model-loop-test-")
+    tmp_registry = Registry(Path(tmp) / "registry.json")
+    original_registry = model_loop_module.Registry
+    model_loop_module.Registry = lambda: tmp_registry
+    GREET_SOURCE = "def greet(name):\n    return \"hi \" + name\n"
+    seen = []
+
+    def tool_call(call_id, name, arguments):
+        return {
+            "content": None,
+            "tool_calls": [{"id": call_id, "name": name,
+                            "arguments": arguments}],
+            "message": {"role": "assistant", "content": None,
+                        "tool_calls": [{"id": call_id, "type": "function",
+                                        "function": {
+                                            "name": name,
+                                            "arguments": json.dumps(arguments)}}]},
+        }
+
+    plan = [
+        tool_call("c-1", "run_shell",
+                  {"command": "echo hello-tool", "timeout_s": 10}),
+        tool_call("c-2", "create_tool",
+                  {"name": "greet", "description": "greets by name",
+                   "source": GREET_SOURCE, "arg_names": ["name"],
+                   "tests": [{"args": ["world"],
+                              "expected": "hi world"}]}),
+        tool_call("c-3", "use_tool",
+                  {"tool": "greet", "args": ["world"]}),
+    ]
+    plan_iter = iter(plan)
+
+    def fake_chat(messages, tools=None):
+        tool_msgs = [m for m in messages if m.get("role") == "tool"]
+        seen.append([json.loads(m["content"]) for m in tool_msgs])
+        try:
+            return next(plan_iter)
+        except StopIteration:
+            return {"content": "done", "tool_calls": [],
+                    "message": {"role": "assistant", "content": "done"}}
+
+    original = model_client.chat
+    model_client.chat = fake_chat
+    try:
+        result = run_model_loop(
+            [{"role": "user", "content": "do the sequence"}],
+            session_factory=lambda: _FakeSession())
+    finally:
+        model_client.chat = original
+        model_loop_module.Registry = original_registry
+
+    assert result["reply"] == "done", result
+    assert result["tool_rounds"] == 3, result
+    # seen[0] is the empty tool list before any call; each later
+    # entry accumulates the tool messages so far, so the newest
+    # result of each round is the last element.
+    assert len(seen) == 4, seen
+    shell_result = seen[1][-1]
+    assert shell_result["ok"] is True, shell_result
+    assert "hello-tool" in shell_result["stdout"], shell_result
+    report = seen[2][-1]
+    assert report["ok"] is True, report
+    assert report["stages"] == ["intake", "validated_call", "execute",
+                                "evidence", "report"], report
+    assert report["tests_passed"] == 1 and report["tests_total"] == 1
+    use_result = seen[3][-1]
+    assert use_result["ok"] is True, use_result
+    assert use_result["tool"] == "greet", use_result
+    assert use_result["result"] == "hi world", use_result
+
+
+def t_shell_api():
+    code, body = http_post("/api/shell",
+                           {"command": "echo shell-proof", "timeout_s": 10})
+    assert code == 200, code
+    data = json.loads(body)
+    assert data["ok"] is True, data
+    assert data["exit_code"] == 0, data
+    assert "shell-proof" in data["stdout"], data
+    assert data["timed_out"] is False, data
+
+
+def t_shell_api_bad_body():
+    code, body = http_post("/api/shell", {})
+    assert code == 400, code
+    assert "command" in body.decode("utf-8")
+    code, body = http_post("/api/shell", {"command": "echo x",
+                                          "timeout_s": "fast"})
+    assert code == 400, code
+    assert "timeout_s" in body.decode("utf-8")
+
+
 def main():
     global BASE
     saved_url = os.environ.get("MODEL_API_URL")
@@ -310,6 +482,12 @@ def main():
             ("model-loop-tool-rules", t_model_loop_tool_rules),
             ("model-loop-unknown-tool-not-executed",
              t_model_loop_unknown_tool_not_executed),
+            ("model-loop-shell-create-use-sequence",
+             t_model_loop_shell_create_use_sequence),
+            ("model-loop-shell-create-use-results",
+             t_model_loop_shell_create_use_results),
+            ("shell-api", t_shell_api),
+            ("shell-api-bad-body", t_shell_api_bad_body),
         ]
         for name, fn in tests:
             check(name, fn)
