@@ -1,0 +1,14 @@
+profiles/
+.env
+*.env
+__pycache__/
+.venv/
+chats/
+work/
+*.pem
+*.key
+cookies
+storage-state.json
+**/storage-state.json
+*.log
+out/

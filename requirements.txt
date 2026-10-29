@@ -1,0 +1,3 @@
+# Agent Ultra 2 runtime dependencies.
+# Everything else is Python stdlib. No other packages are needed.
+playwright
