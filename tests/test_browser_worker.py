@@ -15,6 +15,17 @@ dropping + relaunching once. These tests prove both, including
 an end-to-end HTTP test that mirrors the deployed flow (goto on
 one request thread, screenshot and scroll on later ones).
 
+A second, subtler failure was seen live on the deployed service
+2026-10-29 ~17:12 PKT: a goto on a stale session answered in
+0.1ms with "It looks like you are using Playwright Sync API
+inside the asyncio loop" -- Playwright's thread-local loop state
+was poisoned when the session's driver died mid-call, so
+sync_playwright() could never succeed on that thread again.
+The fix treats that text as a dead-session marker (drop + retry
+once) and makes the worker abandon a poisoned thread for a fresh
+one, retrying the call exactly once there. These tests prove
+that too, with fakes, so they run on any interpreter.
+
 Real-browser tests run ONLY when Playwright and a Chromium
 binary are actually present in this interpreter; otherwise they
 are reported as SKIPPED with the real reason, never faked.
@@ -35,11 +46,14 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO_ROOT))
 
 from browser import playwright_available  # noqa: E402
+from browser.profile import safe_copy_id  # noqa: E402
 from browser.session import BrowserSession  # noqa: E402
 from browser.worker import BrowserWorker, get_worker  # noqa: E402
+import server.chat_server as chat_server  # noqa: E402
 from server.chat_server import (  # noqa: E402
     _drop_session,
     _get_session,
+    _is_dead_result,
     create_server,
     run_browser_action,
 )
@@ -68,7 +82,7 @@ def check(name, fn):
         print(f"PASS {name}")
 
 
-def skip(reason):
+def skip(reason, *_ignored):
     raise _Skip(reason)
 
 
@@ -322,6 +336,144 @@ def t_http_persists_across_requests_real():
             server.server_close()
 
 
+# ------------------------------------------------- 17:12 PKT poison
+# Exact error text the deployed service returned on a stale
+# session: a goto answered in 0.1ms with Playwright's
+# sync-in-asyncio-loop error instead of a dead-connection marker.
+POISON_TEXT = ("Error: It looks like you are using Playwright Sync API "
+               "inside the asyncio loop.\nPlease use the Async API instead.")
+
+
+def t_poison_text_classified_dead():
+    assert _is_dead_result({
+        "ok": False, "action": "goto", "ms": 0.1,
+        "detail": {"error": POISON_TEXT}}) is True
+    assert _is_dead_result({
+        "ok": False, "action": "goto", "ms": 0.1,
+        "detail": {"error": "TargetClosedError: gone"}}) is True
+    assert _is_dead_result({"ok": True, "action": "goto"}) is False
+
+
+def t_worker_heals_poisoned_thread():
+    """A submit that raises the poison error is retried exactly once
+    on a FRESH worker thread; the poisoned thread is abandoned."""
+    worker = BrowserWorker()
+    first_thread = worker.thread_ident
+    assert first_thread is not None
+    attempts = []
+
+    def flaky():
+        attempts.append(threading.get_ident())
+        if len(attempts) == 1:
+            raise Exception(POISON_TEXT)
+        return "healed"
+
+    assert worker.submit(flaky) == "healed"
+    assert len(attempts) == 2, attempts
+    assert attempts[0] == first_thread, attempts
+    assert attempts[1] != first_thread, attempts
+    assert attempts[1] == worker.thread_ident, attempts
+    # The fresh thread keeps working afterwards.
+    assert worker.submit(lambda: threading.get_ident()) == \
+        worker.thread_ident
+
+
+def t_worker_no_heal_on_ordinary_error():
+    """Ordinary failures never replace the worker thread."""
+    worker = BrowserWorker()
+    before = worker.thread_ident
+
+    def boom():
+        raise ValueError("plain failure")
+
+    try:
+        worker.submit(boom)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("exception was swallowed")
+    assert worker.thread_ident == before, (worker.thread_ident, before)
+    assert worker.submit(lambda: 1) == 1
+
+
+class _PoisonSession:
+    """act() returns the exact 17:12 PKT failure: ok:false in 0.1ms
+    with the asyncio-loop error text. Records which thread ran
+    every touch."""
+
+    def __init__(self):
+        self.acts = []
+        self.closed_on = None
+
+    def act(self, action, **kw):
+        self.acts.append((threading.get_ident(), action, kw))
+        return {"ok": False, "action": action, "ms": 0.1,
+                "detail": {"error": POISON_TEXT}}
+
+    def close(self):
+        self.closed_on = threading.get_ident()
+
+
+class _HealSession:
+    """The fresh session the retry runs on."""
+
+    def __init__(self):
+        self.acts = []
+        self.closed_on = None
+
+    def act(self, action, **kw):
+        self.acts.append((threading.get_ident(), action, kw))
+        return {"ok": True, "action": action, "ms": 3.2,
+                "detail": {"url": kw.get("url"), "title": "Healed Page"}}
+
+    def close(self):
+        self.closed_on = threading.get_ident()
+
+
+def t_recovery_asyncio_loop_poison_fake():
+    """The deployed 17:12 failure through the real recovery path:
+    poison text -> classified dead -> session dropped on the
+    browser thread -> exactly one retry on a fresh session ->
+    success, with every Playwright touch on the browser thread
+    and no sync-in-asyncio error in the final result."""
+    made = []
+
+    def fake_get_session(copy_id, base_dir=None):
+        cid = safe_copy_id(copy_id)
+        with chat_server._sessions_lock:
+            sess = chat_server._sessions.get(cid)
+            if sess is None:
+                sess = _PoisonSession() if not made else _HealSession()
+                made.append(sess)
+                chat_server._sessions[cid] = sess
+            return sess
+
+    real_get = chat_server._get_session
+    chat_server._get_session = fake_get_session
+    try:
+        result = run_browser_action(
+            "poison-copy", "goto", {"url": "https://example.com"})
+    finally:
+        chat_server._get_session = real_get
+        with chat_server._sessions_lock:
+            chat_server._sessions.pop("poison-copy", None)
+    assert result["ok"] is True, result
+    assert result["detail"]["title"] == "Healed Page", result
+    assert "asyncio" not in json.dumps(result), result
+    poison, healed = made
+    # The poison session was tried once, dropped, never retried.
+    assert len(poison.acts) == 1, poison.acts
+    assert len(healed.acts) == 1, healed.acts
+    worker = get_worker()
+    for ident, _action, _kw in poison.acts + healed.acts:
+        assert ident == worker.thread_ident, (ident, worker.thread_ident)
+    # The dead session was closed on the browser thread too.
+    assert poison.closed_on == worker.thread_ident, poison.closed_on
+    # The registry now holds the fresh session, not the poison one.
+    with chat_server._sessions_lock:
+        assert "poison-copy" not in chat_server._sessions
+
+
 def main():
     tests = [
         ("worker-single-thread", t_worker_single_thread),
@@ -329,6 +481,12 @@ def main():
         ("worker-nested-inline-no-deadlock", t_worker_nested_inline_no_deadlock),
         ("fake-session-persists-across-caller-threads",
          t_fake_session_persists_across_caller_threads),
+        ("poison-text-classified-dead", t_poison_text_classified_dead),
+        ("worker-heals-poisoned-thread", t_worker_heals_poisoned_thread),
+        ("worker-no-heal-on-ordinary-error",
+         t_worker_no_heal_on_ordinary_error),
+        ("recovery-asyncio-loop-poison-fake",
+         t_recovery_asyncio_loop_poison_fake),
         ("recovery-dead-page-real", t_recovery_dead_page_real),
         ("http-persists-across-requests-real",
          t_http_persists_across_requests_real),
