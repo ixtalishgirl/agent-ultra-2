@@ -16,6 +16,7 @@ import time
 from pathlib import Path
 
 from .actions import _ACTIONS
+from .worker import is_poison_error
 
 
 class BrowserNotAvailable(Exception):
@@ -127,7 +128,18 @@ class BrowserSession:
     def act(self, action, **kw):
         """Run one action, timed. Returns a real result dict with
         measured milliseconds in ``ms`` and the real error in
-        ``detail`` on failure."""
+        ``detail`` on failure.
+
+        One exception is never converted to a failure dict:
+        Playwright's sync-in-asyncio-loop error. It means the
+        calling thread's Playwright state is poisoned (a dead driver
+        left the thread-local loop marked), so no sync_playwright()
+        can ever succeed on that thread again. Swallowing it here
+        would hide it from BrowserWorker.submit(), whose whole job
+        is to detect exactly this error, abandon the poisoned
+        thread, and retry on a fresh one. It is therefore
+        re-raised; every other failure keeps the result-dict
+        contract."""
         t0 = time.perf_counter()
         try:
             detail = _ACTIONS[action](self, **kw)
@@ -139,6 +151,10 @@ class BrowserSession:
             detail = {"error": str(exc)}
             ok = False
         except Exception as exc:  # Playwright errors: timeout, closed, ...
+            if is_poison_error(exc):
+                # Thread-state poison, not a session failure: let the
+                # worker see it, heal the thread, and retry.
+                raise
             detail = {"error": f"{type(exc).__name__}: {exc}"}
             ok = False
         ms = round((time.perf_counter() - t0) * 1000, 1)
