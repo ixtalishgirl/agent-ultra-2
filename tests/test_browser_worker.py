@@ -29,6 +29,18 @@ that too, with fakes, so they run on any interpreter.
 Real-browser tests run ONLY when Playwright and a Chromium
 binary are actually present in this interpreter; otherwise they
 are reported as SKIPPED with the real reason, never faked.
+
+A third failure was seen live 2026-10-29 ~17:45 PKT on the build
+that already had the 17:12 fix: Open accounts.google.com on a
+FRESH copy id answered ok:false in 0.0ms with the same
+asyncio-loop text, and the worker thread was never replaced.
+Root cause: BrowserSession.act() caught the poison error and
+converted it to a failure dict, so submit()'s poison detection
+never saw the exception, the poisoned thread was never
+abandoned, and the dead-result retry ran on the same poisoned
+thread. The fix: act() re-raises the poison error (thread-state
+poison is not a session failure), letting submit() heal the
+thread and retry on a fresh one. These tests prove that.
 """
 
 import glob
@@ -47,7 +59,9 @@ sys.path.insert(0, str(REPO_ROOT))
 
 from browser import playwright_available  # noqa: E402
 from browser.profile import safe_copy_id  # noqa: E402
+import browser.session as session_mod  # noqa: E402
 from browser.session import BrowserSession  # noqa: E402
+from browser import worker as worker_mod  # noqa: E402
 from browser.worker import BrowserWorker, get_worker  # noqa: E402
 import server.chat_server as chat_server  # noqa: E402
 from server.chat_server import (  # noqa: E402
@@ -474,6 +488,214 @@ def t_recovery_asyncio_loop_poison_fake():
         assert "poison-copy" not in chat_server._sessions
 
 
+# ------------------------------------------------- 17:45 PKT round 3
+# The 17:12 fix was deployed but INCOMPLETE: a fresh-copy open on
+# the live build still failed with the asyncio-loop text because
+# BrowserSession.act() swallowed the poison error into a result
+# dict, so the worker never healed its thread. These fakes model
+# Playwright's sticky thread-local poison: once a thread's loop
+# state is poisoned, every later sync_playwright() on THAT thread
+# raises; a fresh thread is clean.
+ROUND3_POISON = ("Error: It looks like you are using Playwright Sync API "
+                 "inside the asyncio loop.\nPlease use the Async API instead.")
+
+
+class _Round3Page:
+    def __init__(self):
+        self.url = "about:blank"
+
+    def title(self):
+        return "Round3 Page"
+
+    def goto(self, url, wait_until=None, timeout=None):
+        self.url = url
+
+
+def _round3_fake_pw():
+    page = _Round3Page()
+
+    class FakeCtx:
+        @property
+        def pages(self):
+            return [page]
+
+        def new_page(self):
+            return page
+
+        def close(self):
+            pass
+
+    class FakeChromium:
+        @staticmethod
+        def launch_persistent_context(*a, **k):
+            return FakeCtx()
+
+    pw = type("FakePW", (), {})()
+    pw.chromium = FakeChromium()
+    pw.stop = lambda: None
+    return pw
+
+
+class _Round3CM:
+    """Fake sync_playwright() context manager. ``first_start_error``
+    is raised by the first start() call and poisons that thread's
+    loop state (like a dead driver does); afterwards every start()
+    on the poisoned thread raises the asyncio-loop error, while any
+    fresh thread gets a working fake browser."""
+
+    first_start_error = None
+    poison_thread = None
+    start_idents = []
+
+    def start(self):
+        ident = threading.get_ident()
+        type(self).start_idents.append(ident)
+        err = type(self).first_start_error
+        if err is not None:
+            type(self).first_start_error = None
+            type(self).poison_thread = ident
+            raise err
+        if type(self).poison_thread is not None and \
+                ident == type(self).poison_thread:
+            raise Exception(ROUND3_POISON)
+        return _round3_fake_pw()
+
+    def stop(self):
+        pass
+
+
+class _SwappedGlobals:
+    """Swap the module-global worker and the session's playwright
+    entry point for one test, restoring both afterwards."""
+
+    def __init__(self, worker):
+        self.worker = worker
+
+    def __enter__(self):
+        self._old_worker = worker_mod._worker
+        self._old_npc = session_mod._new_page_context
+        worker_mod._worker = self.worker
+        session_mod._new_page_context = _Round3CM
+        _Round3CM.first_start_error = None
+        _Round3CM.poison_thread = None
+        _Round3CM.start_idents = []
+        return self
+
+    def __exit__(self, *exc):
+        worker_mod._worker = self._old_worker
+        session_mod._new_page_context = self._old_npc
+        _Round3CM.first_start_error = None
+        _Round3CM.poison_thread = None
+        return False
+
+
+def t_act_reraises_poison_error():
+    """act() must NOT swallow the asyncio-loop poison error: it is
+    thread-state poison, not a session failure, and only submit()
+    can recover from it."""
+
+    class BoomCM:
+        def start(self):
+            raise Exception(ROUND3_POISON)
+
+        def stop(self):
+            pass
+
+    old = session_mod._new_page_context
+    session_mod._new_page_context = BoomCM
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = BrowserSession(Path(tmp) / "p", headless=True)
+            try:
+                session.act("goto", url="https://example.com")
+            except Exception as exc:
+                assert "inside the asyncio loop" in str(exc), exc
+            else:
+                raise AssertionError("act() swallowed the poison error")
+    finally:
+        session_mod._new_page_context = old
+
+
+def t_act_still_swallows_ordinary_errors():
+    """Ordinary Playwright failures keep the result-dict contract:
+    only the poison error propagates."""
+
+    class BoomCM:
+        def start(self):
+            raise Exception("TargetClosedError: gone")
+
+        def stop(self):
+            pass
+
+    old = session_mod._new_page_context
+    session_mod._new_page_context = BoomCM
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            session = BrowserSession(Path(tmp) / "p", headless=True)
+            result = session.act("goto", url="https://example.com")
+    finally:
+        session_mod._new_page_context = old
+    assert result["ok"] is False, result
+    assert "TargetClosedError" in result["detail"]["error"], result
+    assert "asyncio" not in json.dumps(result), result
+
+
+def t_round3_fresh_copy_poisoned_thread():
+    """The exact 17:45 PKT scenario: fresh copy id, worker thread
+    already poisoned. The poison error must reach submit(), the
+    thread must be replaced, and the open must succeed -- with no
+    asyncio text in the final result and every sync_playwright()
+    on a worker thread, never the caller thread."""
+    worker = BrowserWorker()
+    old_ident = worker.thread_ident
+    assert old_ident is not None
+    with _SwappedGlobals(worker):
+        _Round3CM.first_start_error = Exception(ROUND3_POISON)
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                result = run_browser_action(
+                    "round3-login", "goto",
+                    {"url": "https://accounts.google.com/"},
+                    base_dir=Path(tmp))
+            finally:
+                _drop_session("round3-login")
+            idents = list(_Round3CM.start_idents)
+    assert result["ok"] is True, result
+    assert "asyncio" not in json.dumps(result), result
+    assert result["detail"]["url"] == "https://accounts.google.com/", result
+    assert result["detail"]["title"] == "Round3 Page", result
+    # The poisoned thread was abandoned for a fresh one.
+    assert worker.thread_ident != old_ident, \
+        (worker.thread_ident, old_ident)
+    # The poisoned thread was tried, then the fresh thread.
+    assert idents == [old_ident, worker.thread_ident], idents
+    for ident in idents:
+        assert ident != threading.get_ident(), ident
+
+
+def t_round3_dead_driver_then_poison():
+    """Two-stage 17:45 chain: a driver dies mid-call
+    (TargetClosedError, which poisons the thread), then the
+    recovery's fresh session start hits the poison. The combined
+    dead-marker retry + thread-heal must still end in ok:true with
+    no asyncio text."""
+    worker = BrowserWorker()
+    with _SwappedGlobals(worker):
+        _Round3CM.first_start_error = Exception(
+            "TargetClosedError: Playwright connection closed")
+        with tempfile.TemporaryDirectory() as tmp:
+            try:
+                result = run_browser_action(
+                    "round3-dead", "goto",
+                    {"url": "https://accounts.google.com/"},
+                    base_dir=Path(tmp))
+            finally:
+                _drop_session("round3-dead")
+    assert result["ok"] is True, result
+    assert "asyncio" not in json.dumps(result), result
+    assert result["detail"]["title"] == "Round3 Page", result
+
+
 def main():
     tests = [
         ("worker-single-thread", t_worker_single_thread),
@@ -487,6 +709,13 @@ def main():
          t_worker_no_heal_on_ordinary_error),
         ("recovery-asyncio-loop-poison-fake",
          t_recovery_asyncio_loop_poison_fake),
+        ("act-reraises-poison-error", t_act_reraises_poison_error),
+        ("act-still-swallows-ordinary-errors",
+         t_act_still_swallows_ordinary_errors),
+        ("round3-fresh-copy-poisoned-thread",
+         t_round3_fresh_copy_poisoned_thread),
+        ("round3-dead-driver-then-poison",
+         t_round3_dead_driver_then_poison),
         ("recovery-dead-page-real", t_recovery_dead_page_real),
         ("http-persists-across-requests-real",
          t_http_persists_across_requests_real),
