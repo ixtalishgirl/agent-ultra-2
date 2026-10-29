@@ -1,0 +1,27 @@
+# Agent Ultra 2 — Render deploy (Free plan only, no paid anything).
+#
+# HONEST LIMITS, stated upfront:
+# - Render Free sleeps on inactivity and has 512 MB RAM, so it is
+#   NOT 24/7 and NOT a fleet host. Always-on / fleet hosting needs a
+#   larger host, which is a paid step and needs the owner's order.
+# - The backend slot below is EMPTY on purpose: MODEL_API_URL and
+#   MODEL_ID carry NO values here (sync: false, no value). They are
+#   filled only by the owner later. Nothing here is live or deployed
+#   until the owner deploys it and verifies /health.
+# - server/main.py (the entrypoint in deploy/Dockerfile) lands in a
+#   later wave; deploying before it exists will not serve.
+services:
+  - type: web
+    name: agent-ultra-2
+    runtime: docker
+    dockerfilePath: deploy/Dockerfile
+    region: oregon
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: PORT
+        value: 8000
+      - key: MODEL_API_URL
+        sync: false
+      - key: MODEL_ID
+        sync: false
