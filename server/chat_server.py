@@ -9,6 +9,7 @@ Endpoints:
                                or honest 404 "no live browser session"
   GET  /api/browser/status    session list + active copy liveness,
                                probed for real on the browser thread
+                               (?copy=<id> pins the probe to one copy)
   POST /api/browser/action     {"action", "args", "copy_id"} on a
                                per-copy BrowserSession, created lazily
                                with that copy's own profile
@@ -319,10 +320,19 @@ class _Handler(BaseHTTPRequestHandler):
         self.wfile.write(bytes(shot))
 
     def _handle_browser_status(self):
+        # ?copy=<id> pins the probe to one copy's session; without
+        # it the last copy used by an action is probed (previous
+        # behavior). The probe is read-only: it never mutates the
+        # active copy.
+        query = parse_qs(urlsplit(self.path).query)
+        wanted = query.get("copy", [None])[0]
         with _sessions_lock:
             copy_ids = sorted(_sessions.keys())
-            active_id = _last_copy_id["copy_id"]
-            session = _sessions.get(active_id) if active_id else None
+            if wanted:
+                target_id = safe_copy_id(wanted)
+            else:
+                target_id = _last_copy_id["copy_id"]
+            session = _sessions.get(target_id) if target_id else None
             page = getattr(session, "_page", None) if session else None
         alive = None
         url = None
@@ -343,7 +353,7 @@ class _Handler(BaseHTTPRequestHandler):
                     url, title = None, None
         self._send_json(200, {
             "sessions": copy_ids,
-            "active_copy_id": active_id,
+            "active_copy_id": target_id,
             "active_alive": alive,
             "active_url": url,
             "active_title": title,

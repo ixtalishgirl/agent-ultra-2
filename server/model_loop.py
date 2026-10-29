@@ -26,11 +26,24 @@ Rules enforced here:
   - At most 8 tool rounds run (multi-step tasks need it).
   - Any other tool name is NOT executed. The tool message for it
     says so honestly.
+  - The backend model does not emit OpenAI-style tool_calls: it
+    writes tool invocations as PLAIN TEXT in its training format
+    (``{"tool": "shell_execute", "arguments": {...}, "reason":
+    ..., "expected_result": ..., "risk_level": ...}``). The loop
+    therefore also scans each reply's text for such invocations
+    (whole content, ```json fenced blocks, balanced-brace scan),
+    maps the training names to the real executors
+    (``shell_execute`` -> ``run_shell``; any other non-primitive
+    name is dispatched as a registered tool, use_tool semantics),
+    executes them through the same tool-message rounds, and feeds
+    the real results back. Malformed fragments are skipped
+    honestly, never guessed.
   - If the backend is not configured, the reply is exactly
     ``"model not live yet"`` -- never a fabricated reply.
 """
 
 import json
+import re
 
 from browser.profile import DEFAULT_BASE_DIR, profile_dir_for
 from browser.session import BrowserSession
@@ -133,6 +146,128 @@ def _default_session_factory():
 
 def _tool_result_for_unknown(name):
     return {"ok": False, "error": f"unknown tool {name!r}: not executed"}
+
+
+# Training-format tool names the backend model emits in plain
+# text, mapped to the real executors. Observed live 2026-10-29:
+# the model writes {"tool": "shell_execute", ...} and never
+# "run_shell", and never emits OpenAI-style tool_calls.
+_TEXT_TOOL_ALIASES = {
+    "shell_execute": "run_shell",
+    "run_shell": "run_shell",
+    "browser_open": "browser_open",
+    "create_tool": "create_tool",
+    "use_tool": "use_tool",
+}
+
+# Bound on how much reply text is scanned for invocations; model
+# replies are short (max_tokens 256), this is only a guard.
+_TEXT_SCAN_LIMIT = 20000
+
+
+def _iter_balanced_objects(text):
+    """Yield raw text of each top-level balanced {...} substring.
+
+    String quoting and backslash escapes are respected, so braces
+    inside quoted strings do not affect the depth count.
+    """
+    depth = 0
+    start = None
+    in_string = False
+    escape = False
+    for i, ch in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif ch == "\\":
+                escape = True
+            elif ch == '"':
+                in_string = False
+            continue
+        if ch == '"':
+            in_string = True
+        elif ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    yield text[start:i + 1]
+                    start = None
+
+
+def _object_to_call(obj):
+    """One parsed JSON value -> {"name", "arguments"} or None."""
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("tool")
+    if not isinstance(name, str) or not name:
+        return None
+    args = obj.get("arguments", {})
+    if args is None:
+        args = {}
+    if not isinstance(args, dict):
+        return None
+    return {"name": name, "arguments": args}
+
+
+def _candidate_to_call(raw):
+    """One JSON candidate string -> list of calls (maybe empty).
+
+    A top-level JSON array contributes one call per element that
+    has the training shape; anything else contributes nothing.
+    """
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return []
+    if isinstance(obj, list):
+        return [c for c in (_object_to_call(item) for item in obj)
+                if c is not None]
+    call = _object_to_call(obj)
+    return [call] if call is not None else []
+
+
+def _extract_text_tool_calls(content):
+    """Find training-format tool invocations in the model's text.
+
+    Tries, in order: (a) the whole content as one JSON value;
+    (b) ```json (or bare ```) fenced blocks; (c) balanced-brace
+    scanning of the remaining text. Malformed fragments are
+    skipped honestly, never guessed. Exact duplicates (same name
+    and same arguments) are kept only once. Returns the calls in
+    the order found.
+    """
+    found = []
+    seen = set()
+
+    def add(calls):
+        for call in calls:
+            key = (call["name"],
+                   json.dumps(call["arguments"], sort_keys=True,
+                              default=str))
+            if key not in seen:
+                seen.add(key)
+                found.append(call)
+
+    text = content or ""
+    if len(text) > _TEXT_SCAN_LIMIT:
+        text = text[:_TEXT_SCAN_LIMIT]
+    stripped = text.strip()
+    whole = _candidate_to_call(stripped)
+    if whole:
+        add(whole)
+        return found
+    fence_re = re.compile(r"```(?:json)?\s*\n?(.*?)```", re.DOTALL)
+    fences = list(fence_re.finditer(text))
+    for match in fences:
+        add(_candidate_to_call(match.group(1).strip()))
+    remaining = fence_re.sub(" ", text)
+    for raw in _iter_balanced_objects(remaining):
+        add(_candidate_to_call(raw))
+    return found
 
 
 def _exec_run_shell(args):
@@ -241,6 +376,65 @@ def _exec_use_tool(args):
     return {"ok": True, "tool": name, "result": output}
 
 
+def _browser_open_result(url, ctx):
+    """Run one real browser_open goto; the real, measured result.
+
+    ``ctx`` carries the loop's mutable state: "session",
+    "session_owned", "session_factory" and "browser_results".
+    The session is created lazily on first use; Playwright itself
+    only ever runs on the dedicated browser worker thread.
+    """
+    if not isinstance(url, str) or not url:
+        return {"ok": False,
+                "error": "browser_open needs a url string"}
+    if ctx["session"] is None:
+        factory = ctx.get("session_factory") or _default_session_factory
+        ctx["session"] = factory()
+        ctx["session_owned"] = ctx.get("session_factory") is None
+    result = get_worker().submit(
+        lambda: ctx["session"].act("goto", url=url))
+    ctx["browser_results"].append(result)
+    return result
+
+
+def _execute_text_call(name, args, ctx):
+    """Execute one training-format tool invocation.
+
+    Primitive training names go to the real executors; any other
+    name is a created tool's own name and is dispatched through
+    the registry with the arguments object as its kwargs
+    (use_tool semantics). A name the registry does not know is
+    not executed: the honest not-executed result goes back.
+    """
+    mapped = _TEXT_TOOL_ALIASES.get(name)
+    if mapped == "browser_open":
+        return _browser_open_result(
+            args.get("url") if isinstance(args, dict) else None, ctx)
+    if mapped == "run_shell":
+        return _exec_run_shell(args)
+    if mapped == "create_tool":
+        return _exec_create_tool(args)
+    if mapped == "use_tool":
+        return _exec_use_tool(args)
+    # A created tool's own name: registry dispatch with the
+    # arguments object as kwargs. The listing is checked first so
+    # an unknown name takes the honest not-executed path.
+    try:
+        registry = Registry()
+    except Exception as exc:
+        return {"ok": False, "error": f"registry unavailable: {exc}"}
+    if name not in registry.list():
+        return _tool_result_for_unknown(name)
+    try:
+        output = registry.dispatch(
+            name, args if isinstance(args, dict) else {})
+    except ToolNotFoundError as exc:
+        return {"ok": False, "error": str(exc)}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+    return {"ok": True, "tool": name, "result": output}
+
+
 def run(messages, session_factory=None):
     """Run one user thread through the backend with the model tools.
 
@@ -272,10 +466,16 @@ def run(messages, session_factory=None):
     working = list(messages)
     browser_results = []
     tool_rounds = 0
-    session = None
-    session_owned = False
     error = None
     reply = None
+    # Shared mutable state for both tool-call shapes; the session
+    # is owned by the loop only when it created it itself.
+    ctx = {
+        "session": None,
+        "session_owned": False,
+        "session_factory": session_factory,
+        "browser_results": browser_results,
+    }
     try:
         while True:
             try:
@@ -295,7 +495,13 @@ def run(messages, session_factory=None):
                 break
             content = response.get("content")
             tool_calls = response.get("tool_calls") or []
-            if not tool_calls:
+            # The backend writes invocations as plain text in its
+            # training format; parse them only when no structured
+            # tool_calls came back.
+            text_calls = []
+            if not tool_calls and isinstance(content, str) and content:
+                text_calls = _extract_text_tool_calls(content)
+            if not tool_calls and not text_calls:
                 if isinstance(content, str) and content:
                     reply = content
                 else:
@@ -317,20 +523,7 @@ def run(messages, session_factory=None):
                 args = call.get("arguments") or {}
                 if name == "browser_open":
                     url = args.get("url") if isinstance(args, dict) else None
-                    if not isinstance(url, str) or not url:
-                        result = {"ok": False,
-                                  "error": "browser_open needs a url string"}
-                    else:
-                        if session is None:
-                            factory = session_factory or _default_session_factory
-                            session = factory()
-                            session_owned = session_factory is None
-                        # The loop runs on an HTTP handler thread;
-                        # Playwright itself only ever runs on the
-                        # dedicated browser worker thread.
-                        result = get_worker().submit(
-                            lambda: session.act("goto", url=url))
-                        browser_results.append(result)
+                    result = _browser_open_result(url, ctx)
                 elif name == "run_shell":
                     result = _exec_run_shell(args)
                 elif name == "create_tool":
@@ -344,10 +537,18 @@ def run(messages, session_factory=None):
                     "tool_call_id": call.get("id"),
                     "content": json.dumps(result, default=str),
                 })
+            for tcall in text_calls:
+                result = _execute_text_call(
+                    tcall["name"], tcall["arguments"], ctx)
+                working.append({
+                    "role": "tool",
+                    "tool_call_id": None,
+                    "content": json.dumps(result, default=str),
+                })
     finally:
-        if session is not None and session_owned:
+        if ctx["session"] is not None and ctx["session_owned"]:
             try:
-                get_worker().submit(session.close, timeout=30)
+                get_worker().submit(ctx["session"].close, timeout=30)
             except Exception:
                 pass
     return {
