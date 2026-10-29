@@ -1,0 +1,37 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Ultra 2</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<header>
+  <h1>Agent Ultra 2</h1>
+  <p id="status">Local build. Backend status is shown with each reply.</p>
+</header>
+<main>
+  <section id="chat-panel">
+    <h2>Chat</h2>
+    <div id="chat-area" aria-live="polite"></div>
+    <form id="chat-form">
+      <input id="chat-input" type="text" autocomplete="off" placeholder="Message">
+      <button type="submit">Send</button>
+    </form>
+  </section>
+  <section id="browser-panel">
+    <h2>Browser</h2>
+    <div id="browser-status">No live browser session.</div>
+    <img id="browser-screen" alt="" hidden>
+    <form id="browser-form">
+      <input id="browser-copy" type="text" value="primary" aria-label="Copy id">
+      <input id="browser-url" type="text" autocomplete="off" placeholder="URL" aria-label="URL">
+      <button type="submit">Open</button>
+    </form>
+    <pre id="browser-result"></pre>
+  </section>
+</main>
+<script src="/ui/app.js"></script>
+</body>
+</html>
